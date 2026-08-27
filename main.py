@@ -1,59 +1,46 @@
 import os
 import psycopg2
-from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
-from openai import OpenAI
+from fastembed import TextEmbedding
 
-app = FastAPI(title="pgvector Recipe Recommender")
+app = FastAPI()
 
-# Initialize OpenAI client and DB URL from Railway environment variables
 DATABASE_URL = os.getenv("DATABASE_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+print("Loading fastembed model...")
+model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
-class SearchQuery(BaseModel):
-    prompt: str
-    top_k: int = 3
+class QueryRequest(BaseModel):
+    query: str
 
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+@app.get("/")
+def read_root():
+    return {"status": "Semantic Note Search API is running!"}
 
-@app.post("/recommend")
-def recommend_recipes(query: SearchQuery):
-    if not DATABASE_URL:
-        raise HTTPException(status_code=500, detail="DATABASE_URL not set")
+@app.post("/search")
+def search_notes(request: QueryRequest):
+    embeddings = list(model.embed([request.query]))
+    query_vector = embeddings[0].tolist()
 
-    # 1. Convert user's plain language text prompt into a vector
-    try:
-        response = client.embeddings.create(
-            input=query.prompt,
-            model="text-embedding-3-small"
-        )
-        query_vector = response.data[0].embedding
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding error: {str(e)}")
-
-    # 2. Perform Cosine Similarity Search in pgvector
-    conn = get_db_connection()
+    conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
-    # The `<=>` operator computes cosine distance (1 - cosine similarity)
-    sql = """
-        SELECT id, title, description, (embedding <=> %s::vector) AS distance
+    cur.execute(
+        """
+        SELECT title, description, embedding <-> %s::vector AS distance
         FROM recipes
         ORDER BY distance ASC
-        LIMIT %s;
-    """
-
-    cur.execute(sql, (str(query_vector), query.top_k))
+        LIMIT 3;
+        """,
+        (str(query_vector),)
+    )
+    
     results = cur.fetchall()
-
     cur.close()
     conn.close()
 
-    return {
-        "user_query": query.prompt,
-        "recommendations": results
-    }
+    return [
+        {"title": r[0], "description": r[1], "score": float(r[2])}
+        for r in results
+    ]
